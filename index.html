@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AquaVise — Smart Aquaculture Monitor</title>
+  <link rel="stylesheet" href="style.css" />
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Firebase SDK v9 (compat mode for simplicity) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+</head>
+<body>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       AUTH SCREEN
+  ═══════════════════════════════════════════════════════════ -->
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <svg class="logo-icon" viewBox="0 0 48 48" fill="none">
+          <circle cx="24" cy="24" r="22" stroke="var(--accent)" stroke-width="2"/>
+          <path d="M24 8 C16 16 10 20 10 28 C10 36 16 42 24 42 C32 42 38 36 38 28 C38 20 32 16 24 8Z"
+                fill="var(--accent)" opacity="0.15"/>
+          <path d="M24 14 C19 20 15 23 15 29 C15 34.5 19 38 24 38 C29 38 33 34.5 33 29 C33 23 29 20 24 14Z"
+                fill="var(--accent)" opacity="0.4"/>
+          <circle cx="24" cy="30" r="4" fill="var(--accent)"/>
+        </svg>
+        <span class="logo-text">AquaVise</span>
+      </div>
+      <p class="auth-tagline">Intelligent Aquaculture Monitoring</p>
+
+      <!-- Tab Switcher -->
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-tab="login">Sign In</button>
+        <button class="auth-tab" data-tab="signup">Sign Up</button>
+      </div>
+
+      <!-- Login Form -->
+      <form id="login-form" class="auth-form active">
+        <div class="field-group">
+          <label for="login-email">Email</label>
+          <input type="email" id="login-email" placeholder="you@example.com" autocomplete="email" required />
+        </div>
+        <div class="field-group">
+          <label for="login-password">Password</label>
+          <input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password" required />
+        </div>
+        <button type="submit" class="btn-primary" id="login-btn">
+          <span class="btn-label">Sign In</span>
+          <span class="btn-spinner hidden"></span>
+        </button>
+        <p class="auth-error hidden" id="login-error"></p>
+      </form>
+
+      <!-- Signup Form -->
+      <form id="signup-form" class="auth-form">
+        <div class="field-group">
+          <label for="signup-email">Email</label>
+          <input type="email" id="signup-email" placeholder="you@example.com" autocomplete="email" required />
+        </div>
+        <div class="field-group">
+          <label for="signup-password">Password</label>
+          <input type="password" id="signup-password" placeholder="Min. 8 characters" autocomplete="new-password" required />
+        </div>
+        <button type="submit" class="btn-primary" id="signup-btn">
+          <span class="btn-label">Create Account</span>
+          <span class="btn-spinner hidden"></span>
+        </button>
+        <p class="auth-error hidden" id="signup-error"></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       MAIN APP
+  ═══════════════════════════════════════════════════════════ -->
+  <div id="app" class="app hidden">
+
+    <!-- ── Top Navigation ──────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <svg class="logo-icon sm" viewBox="0 0 48 48" fill="none">
+          <circle cx="24" cy="24" r="22" stroke="var(--accent)" stroke-width="2"/>
+          <path d="M24 14 C19 20 15 23 15 29 C15 34.5 19 38 24 38 C29 38 33 34.5 33 29 C33 23 29 20 24 14Z"
+                fill="var(--accent)" opacity="0.5"/>
+          <circle cx="24" cy="30" r="4" fill="var(--accent)"/>
+        </svg>
+        <span class="site-name">AquaVise</span>
+      </div>
+      <div class="topbar-right">
+        <div class="device-badge" id="device-status-badge">
+          <span class="badge-dot" id="device-dot"></span>
+          <span id="device-label">Offline</span>
+        </div>
+        <button class="btn-icon" id="logout-btn" title="Sign Out">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ── Main Content ─────────────────────────────────────────── -->
+    <main class="dashboard">
+
+      <!-- Alert Banner -->
+      <div class="alert-banner hidden" id="alert-banner">
+        <span class="alert-icon">⚠</span>
+        <span id="alert-message">Alert message</span>
+        <button class="alert-close" id="alert-close">✕</button>
+      </div>
+
+      <!-- ── Sensor Cards Row ────────────────────────────────────── -->
+      <section class="section-title">
+        <h2>Live Parameters</h2>
+        <span class="last-updated">Last updated: <span id="last-updated-time">—</span></span>
+      </section>
+
+      <div class="sensor-grid">
+        <!-- Turbidity -->
+        <div class="sensor-card" id="card-turbidity" data-param="turbidity">
+          <div class="sensor-card-header">
+            <div class="sensor-icon turbidity-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2C6 8 3 11 3 15a9 9 0 1018 0c0-4-3-7-9-13z"/>
+              </svg>
+            </div>
+            <div class="sensor-meta">
+              <span class="sensor-label">Turbidity</span>
+              <span class="sensor-unit">NTU</span>
+            </div>
+            <div class="status-pill" id="turb-status">safe</div>
+          </div>
+          <div class="sensor-value-row">
+            <span class="sensor-value" id="turb-value">—</span>
+          </div>
+          <div class="sensor-bar-track">
+            <div class="sensor-bar" id="turb-bar" style="width:0%"></div>
+          </div>
+          <div class="sensor-range-labels">
+            <span>0</span><span>300</span><span>600</span><span>3000</span>
+          </div>
+        </div>
+
+        <!-- pH -->
+        <div class="sensor-card" id="card-ph" data-param="ph">
+          <div class="sensor-card-header">
+            <div class="sensor-icon ph-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M8 12h3m0 0V8m0 4v4m4-8h2a2 2 0 010 4h-2"/>
+              </svg>
+            </div>
+            <div class="sensor-meta">
+              <span class="sensor-label">pH Level</span>
+              <span class="sensor-unit">pH</span>
+            </div>
+            <div class="status-pill" id="ph-status">safe</div>
+          </div>
+          <div class="sensor-value-row">
+            <span class="sensor-value" id="ph-value">—</span>
+          </div>
+          <div class="sensor-bar-track">
+            <div class="sensor-bar" id="ph-bar" style="width:0%"></div>
+          </div>
+          <div class="sensor-range-labels">
+            <span>0</span><span>6.5</span><span>7.5</span><span>14</span>
+          </div>
+        </div>
+
+        <!-- Temperature -->
+        <div class="sensor-card" id="card-temp" data-param="temperature">
+          <div class="sensor-card-header">
+            <div class="sensor-icon temp-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z"/>
+              </svg>
+            </div>
+            <div class="sensor-meta">
+              <span class="sensor-label">Temperature</span>
+              <span class="sensor-unit">°C</span>
+            </div>
+            <div class="status-pill" id="temp-status">safe</div>
+          </div>
+          <div class="sensor-value-row">
+            <span class="sensor-value" id="temp-value">—</span>
+          </div>
+          <div class="sensor-bar-track">
+            <div class="sensor-bar" id="temp-bar" style="width:0%"></div>
+          </div>
+          <div class="sensor-range-labels">
+            <span>0°</span><span>18°</span><span>28°</span><span>40°</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Historical Charts ────────────────────────────────────── -->
+      <section class="section-title">
+        <h2>Historical Trends</h2>
+        <div class="chart-controls">
+          <button class="chart-range-btn active" data-range="20">20 pts</button>
+          <button class="chart-range-btn" data-range="50">50 pts</button>
+          <button class="chart-range-btn" data-range="100">100 pts</button>
+        </div>
+      </section>
+
+      <div class="charts-grid">
+        <div class="chart-card">
+          <h3>Turbidity (NTU)</h3>
+          <div class="chart-container">
+            <canvas id="chart-turbidity"></canvas>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>pH Level</h3>
+          <div class="chart-container">
+            <canvas id="chart-ph"></canvas>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>Temperature (°C)</h3>
+          <div class="chart-container">
+            <canvas id="chart-temperature"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Pump Control Panel ────────────────────────────────────── -->
+      <section class="section-title">
+        <h2>Pump Control</h2>
+      </section>
+
+      <div class="pump-grid">
+        <!-- Freshwater Pump -->
+        <div class="pump-card" id="card-pump-fresh">
+          <div class="pump-header">
+            <div class="pump-icon fresh-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 22V12m0 0L8 16m4-4l4 4M5 12a7 7 0 1114 0H5z"/>
+              </svg>
+            </div>
+            <div>
+              <p class="pump-label">Freshwater Pump</p>
+              <p class="pump-sublabel">Inlet supply control</p>
+            </div>
+          </div>
+          <div class="pump-status-row">
+            <span class="pump-state-badge" id="fresh-state-badge">OFF</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="toggle-fresh" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+          <p class="pump-last-on">Last activated: <span id="fresh-last-on">Never</span></p>
+        </div>
+
+        <!-- Drain Pump -->
+        <div class="pump-card" id="card-pump-drain">
+          <div class="pump-header">
+            <div class="pump-icon drain-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2v10m0 0l-4-4m4 4l4-4M5 12a7 7 0 1014 0H5z"/>
+              </svg>
+            </div>
+            <div>
+              <p class="pump-label">Drain Pump</p>
+              <p class="pump-sublabel">Waste water removal</p>
+            </div>
+          </div>
+          <div class="pump-status-row">
+            <span class="pump-state-badge" id="drain-state-badge">OFF</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="toggle-drain" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+          <p class="pump-last-on">Last activated: <span id="drain-last-on">Never</span></p>
+        </div>
+      </div>
+
+      <!-- ── AI Insights Panel ─────────────────────────────────────── -->
+      <section class="section-title">
+        <h2>AI Insights</h2>
+        <span class="badge-subtle">Rule-Based Engine</span>
+      </section>
+
+      <div class="insights-panel" id="insights-panel">
+        <div class="insight-loading">
+          <div class="spinner"></div>
+          <span>Analysing water conditions…</span>
+        </div>
+      </div>
+
+      <!-- ── Alert Log ─────────────────────────────────────────────── -->
+      <section class="section-title">
+        <h2>Alert Log</h2>
+        <button class="btn-text-sm" id="clear-alerts-btn">Clear</button>
+      </section>
+
+      <div class="alert-log" id="alert-log">
+        <p class="no-alerts">No alerts recorded yet.</p>
+      </div>
+
+    </main>
+
+    <footer class="app-footer">
+      <span>AquaVise v1.0 © 2024</span>
+      <span id="footer-user-email"></span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
