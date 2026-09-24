@@ -1,0 +1,517 @@
+/*
+ * ============================================================
+ *  AquaVise — ESP32 Firebase Edition  (v2.1 - Actuator Upgrade)
+ *  Firebase Realtime Database · Self-Healing WiFi · 20x4 LCD
+ * ============================================================
+ */
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Firebase_ESP_Client.h>
+#include <WiFiManager.h>          
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ─────────────────────────────────────────────────────────────
+//  USER CONFIGURATION
+// ─────────────────────────────────────────────────────────────
+#define AP_NAME                  "AquaVise-Setup"
+#define AP_PASSWORD               "aquavise123"
+
+#define PORTAL_TIMEOUT_SECONDS    180
+
+#define FIREBASE_API_KEY          "AIzaSyArw1ycWAbCnfE2JWM0OMTMzDrzp4KyAdU"
+#define FIREBASE_DATABASE_URL     "https://babyhub-e35bb-default-rtdb.firebaseio.com"
+
+#define FIREBASE_USER_EMAIL       "mubarakerinfolami17@gmail.com"
+#define FIREBASE_USER_PASSWORD    "Nopassword"
+
+// ─────────────────────────────────────────────────────────────
+//  PIN DEFINITIONS (FINAL)
+// ─────────────────────────────────────────────────────────────
+#define TURBIDITY_PIN     34   // Analog IN
+#define PH_PIN            36   // Analog IN
+#define TEMP_PIN          39   // Analog IN
+
+// Valve 1
+#define VALVE1_OPEN_PIN   27   
+#define VALVE1_CLOSE_PIN  25   
+
+// Valve 2
+#define VALVE2_OPEN_PIN   14   
+#define VALVE2_CLOSE_PIN  32   
+
+// Standard Pumps
+#define AERATOR_PIN       26   
+#define RECYCLE_PUMP_PIN  33   
+
+#define BUZZER_PIN        4
+#define LCD_SDA           21
+#define LCD_SCL           22
+
+// ─────────────────────────────────────────────────────────────
+//  SENSOR CALIBRATION CONSTANTS
+// ─────────────────────────────────────────────────────────────
+#define ADC_MAX             4095.0f
+#define ADC_VREF              3.3f
+#define PH_OFFSET             0.0f
+#define PH_SLOPE               0.1786f  
+#define TEMP_SCALE_C_PER_V   100.0f
+
+// ─────────────────────────────────────────────────────────────
+//  LCD & FIREBASE OBJECTS
+// ─────────────────────────────────────────────────────────────
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+byte barFull[8]  = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F}; 
+byte barEmpty[8] = {0x00,0x00,0x00,0x1F,0x1F,0x00,0x00,0x00}; 
+
+FirebaseData   fbdo;
+FirebaseData   fbStream;
+FirebaseAuth   auth;
+FirebaseConfig config;
+
+bool firebaseReady   = false;
+bool streamStarted   = false;
+
+Preferences prefs;
+
+// ─────────────────────────────────────────────────────────────
+//  SYSTEM STATE
+// ─────────────────────────────────────────────────────────────
+bool  valve1State      = false; // true = Open, false = Closed
+bool  valve2State      = false;
+bool  aeratorState     = false;
+bool  recyclePumpState = false;
+
+float realTemperature      = 25.0;
+float realPH                = 7.0;
+float realTurbidity        = 0.0;
+float turbidityThreshold   = 3.0;
+
+// ─────────────────────────────────────────────────────────────
+//  TIMING
+// ─────────────────────────────────────────────────────────────
+unsigned long lastSensorUpload = 0;
+unsigned long lastLCDUpdate    = 0;
+unsigned long lastTempRead     = 0;
+unsigned long lastPHRead       = 0;
+unsigned long lastTurbRead     = 0;
+unsigned long toggleMsgTime    = 0;
+
+const unsigned long SENSOR_UPLOAD_MS = 5000;
+const unsigned long LCD_INTERVAL_MS  = 1000;
+const unsigned long TEMP_READ_MS     = 2000;
+const unsigned long PH_READ_MS       = 2000;
+const unsigned long TURB_READ_MS     = 1000;
+const unsigned long TOGGLE_MSG_MS    = 3000;
+
+bool showToggleMsg = false;
+
+// ─────────────────────────────────────────────────────────────
+//  UTILITY & SENSORS
+// ─────────────────────────────────────────────────────────────
+float clampf(float v, float lo, float hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+int readAnalogAveraged(int pin, uint8_t samples = 10) {
+  long total = 0;
+  for (uint8_t i = 0; i < samples; i++) {
+    total += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return (int)(total / samples);
+}
+
+float readTurbidityNTU() {
+  int raw = readAnalogAveraged(TURBIDITY_PIN);
+  float ntu = 10.0f - (raw / 409.5f);
+  return clampf(ntu, 0.0f, 10.0f);
+}
+
+float readPH() {
+  int raw    = readAnalogAveraged(PH_PIN);
+  float volt = (raw * ADC_VREF) / ADC_MAX;
+  float ph   = (volt / PH_SLOPE) + PH_OFFSET;
+  return clampf(ph, 0.0f, 14.0f);
+}
+
+float readTemperatureC() {
+  int raw    = readAnalogAveraged(TEMP_PIN);
+  float volt = (raw * ADC_VREF) / ADC_MAX;
+  float tempC = volt * TEMP_SCALE_C_PER_V;
+  return clampf(tempC, -10.0f, 85.0f);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ACTUATORS & PUMPS (WITH SAFETY INTERLOCKS)
+// ─────────────────────────────────────────────────────────────
+
+void applyPump(int relayPin, bool state) {
+  digitalWrite(relayPin, state ? HIGH : LOW);
+}
+
+// FAILSAFE FUNCTION: Prevents opening and closing simultaneously
+void applyValve(int openPin, int closePin, bool openState) {
+  // 1. Force both pins LOW immediately to break any active circuit
+  digitalWrite(openPin, LOW);
+  digitalWrite(closePin, LOW);
+  
+  // 2. Hardware Deadband: Wait 100ms for relays to mechanically detach
+  delay(100); 
+
+  // 3. Safely apply the new state
+  if (openState) {
+    digitalWrite(openPin, HIGH);  // Drive the motor to OPEN
+  } else {
+    digitalWrite(closePin, HIGH); // Drive the motor to CLOSE
+  }
+}
+
+void beep(int ms = 200) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LCD UI
+// ─────────────────────────────────────────────────────────────
+String padTo(String s, uint8_t width) {
+  while (s.length() < width) s += ' ';
+  if (s.length() > width) s = s.substring(0, width);
+  return s;
+}
+
+void lcdCenterPrint(const String &text, uint8_t row, uint8_t width = 20) {
+  int pad = (width - (int)text.length()) / 2;
+  if (pad < 0) pad = 0;
+  String line = "";
+  for (int i = 0; i < pad; i++) line += ' ';
+  line += text;
+  lcd.setCursor(0, row);
+  lcd.print(padTo(line, width));
+}
+
+void showLCDMsg(const char* line1, const char* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 1); lcdCenterPrint(line1, 1);
+  lcd.setCursor(0, 2); lcdCenterPrint(line2, 2);
+  showToggleMsg  = true;
+  toggleMsgTime  = millis();
+}
+
+void bootScreenInit() {
+  lcd.createChar(0, barFull);
+  lcd.createChar(1, barEmpty);
+  lcd.clear();
+  lcdCenterPrint("AquaVise", 0);
+  lcdCenterPrint("Smart Aquaculture", 1);
+}
+
+void bootProgress(uint8_t pct, const String &status) {
+  pct = (pct > 100) ? 100 : pct;
+  const uint8_t barWidth = 18;
+  uint8_t filled = (uint8_t)((pct / 100.0f) * barWidth);
+
+  lcd.setCursor(1, 2);
+  for (uint8_t i = 0; i < barWidth; i++) {
+    lcd.write(i < filled ? byte(0) : byte(1));
+  }
+  String line = status + " " + String(pct) + "%";
+  lcdCenterPrint(line, 3);
+}
+
+void bootFail(const String &line1, const String &line2) {
+  lcd.clear();
+  lcdCenterPrint(line1, 1);
+  lcdCenterPrint(line2, 2);
+}
+
+void updateLCD() {
+  if (showToggleMsg && (millis() - toggleMsgTime < TOGGLE_MSG_MS)) return;
+  showToggleMsg = false;
+
+  String row0 = "Temp: " + String(realTemperature, 1) + " C";
+  if (realTemperature < 24.0 || realTemperature > 28.0) row0 += "  ALRT";
+  lcd.setCursor(0, 0);
+  lcd.print(padTo(row0, 20));
+
+  String row1 = "pH:   " + String(realPH, 2);
+  if (realPH < 6.2 || realPH > 6.8) row1 += "      ALRT";
+  lcd.setCursor(0, 1);
+  lcd.print(padTo(row1, 20));
+
+  String row2 = "Turb: " + String(realTurbidity, 1) + " NTU";
+  if (realTurbidity > turbidityThreshold) row2 += " HIGH";
+  lcd.setCursor(0, 2);
+  lcd.print(padTo(row2, 20));
+
+  String row3 = "V1:" + String(valve1State      ? "OPN " : "CLS") +
+                " V2:" + String(valve2State      ? "OPN " : "CLS") +
+                " A:"  + String(aeratorState     ? "ON" : "OF") +
+                " R:"  + String(recyclePumpState? "ON" : "OF");
+  lcd.setCursor(0, 3);
+  lcd.print(padTo(row3, 20));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FIREBASE COMMS
+// ─────────────────────────────────────────────────────────────
+void uploadSensorData() {
+  if (!Firebase.ready()) return;
+  Firebase.RTDB.setFloat(&fbdo, "/sensors/temperature", realTemperature);
+  Firebase.RTDB.setFloat(&fbdo, "/sensors/ph",          realPH);
+  Firebase.RTDB.setFloat(&fbdo, "/sensors/turbidity",   realTurbidity);
+}
+
+void readInitialPumpStates() {
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.getBool(&fbdo, "/freshwaterPump"))
+    valve1State = fbdo.boolData();
+  if (Firebase.RTDB.getBool(&fbdo, "/drainPump"))
+    valve2State = fbdo.boolData();
+  if (Firebase.RTDB.getBool(&fbdo, "/aeratorPump"))
+    aeratorState = fbdo.boolData();
+  if (Firebase.RTDB.getBool(&fbdo, "/recyclePump"))
+    recyclePumpState = fbdo.boolData();
+  if (Firebase.RTDB.getFloat(&fbdo, "/turbidityThreshold"))
+    turbidityThreshold = fbdo.floatData();
+
+  // Apply safe valve functions on startup
+  applyValve(VALVE1_OPEN_PIN, VALVE1_CLOSE_PIN, valve1State);
+  applyValve(VALVE2_OPEN_PIN, VALVE2_CLOSE_PIN, valve2State);
+  
+  applyPump(AERATOR_PIN,      aeratorState);
+  applyPump(RECYCLE_PUMP_PIN, recyclePumpState);
+
+  Serial.println("Initial states loaded from Firebase.");
+}
+
+void streamCallback(FirebaseStream data) {
+  String path = data.dataPath();
+  Serial.print("Stream update -> "); Serial.println(path);
+
+  if (path == "/freshwaterPump") {
+    bool newState = data.boolData();
+    if (newState != valve1State) {
+      valve1State = newState;
+      applyValve(VALVE1_OPEN_PIN, VALVE1_CLOSE_PIN, valve1State);
+      showLCDMsg("Freshwater Valve", valve1State ? "OPENING" : "CLOSING");
+      beep(500);
+    }
+  }
+  else if (path == "/drainPump") {
+    bool newState = data.boolData();
+    if (newState != valve2State) {
+      valve2State = newState;
+      applyValve(VALVE2_OPEN_PIN, VALVE2_CLOSE_PIN, valve2State);
+      showLCDMsg("Drain Valve", valve2State ? "OPENING" : "CLOSING");
+      beep(500);
+    }
+  }
+  else if (path == "/aeratorPump") {
+    bool newState = data.boolData();
+    if (newState != aeratorState) {
+      aeratorState = newState;
+      applyPump(AERATOR_PIN, aeratorState);
+      showLCDMsg("Aerator Pump", aeratorState ? "TURNED ON" : "TURNED OFF");
+      beep(500);
+    }
+  }
+  else if (path == "/recyclePump") {
+    bool newState = data.boolData();
+    if (newState != recyclePumpState) {
+      recyclePumpState = newState;
+      applyPump(RECYCLE_PUMP_PIN, recyclePumpState);
+      showLCDMsg("Recycle Pump", recyclePumpState ? "TURNED ON" : "TURNED OFF");
+      beep(500);
+    }
+  }
+  else if (path == "/turbidityThreshold") {
+    float newThresh = data.floatData();
+    if (newThresh >= 1.0f && newThresh <= 10.0f) {
+      turbidityThreshold = newThresh;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.1f NTU", turbidityThreshold);
+      showLCDMsg("Threshold Set", buf);
+    }
+  }
+  else if (path == "/" && data.dataType() == "json") {
+    readInitialPumpStates();
+  }
+}
+
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) {
+    Serial.println("Stream timeout - will reconnect.");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  WIFIMANAGER
+// ─────────────────────────────────────────────────────────────
+WiFiManager wm;
+
+void onConfigPortalStart(WiFiManager *myWM) {
+  lcd.clear();
+  lcdCenterPrint("Setup Mode", 0);
+  lcdCenterPrint("Connect WiFi to:", 1);
+  lcdCenterPrint(AP_NAME, 2);
+  lcdCenterPrint("192.168.4.1", 3);
+}
+
+void onConfigPortalSaved() {
+  lcd.clear();
+  lcdCenterPrint("WiFi Saved!", 1);
+  lcdCenterPrint("Reconnecting...", 2);
+  delay(1200);
+}
+
+void connectWiFiOrStartPortal() {
+  bootProgress(15, "Scanning networks");
+
+  wm.setAPCallback(onConfigPortalStart);
+  wm.setSaveConfigCallback(onConfigPortalSaved);
+  wm.setConfigPortalTimeout(PORTAL_TIMEOUT_SECONDS);
+  wm.setConnectTimeout(15);          
+  wm.setBreakAfterConfig(true);      
+
+  bootProgress(30, "Connecting WiFi");
+
+  bool connected = wm.autoConnect(AP_NAME, AP_PASSWORD);
+
+  if (connected) {
+    bootProgress(55, "WiFi Connected");
+  } else {
+    bootFail("Setup Timed Out", "Restarting...");
+    delay(2000);
+    ESP.restart();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  // Initialize Valve Pins and Pumps
+  int outputs[] = {
+    VALVE1_OPEN_PIN, VALVE1_CLOSE_PIN, 
+    VALVE2_OPEN_PIN, VALVE2_CLOSE_PIN, 
+    AERATOR_PIN, RECYCLE_PUMP_PIN, BUZZER_PIN
+  };
+  
+  for (int pin : outputs) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW); // Ensure everything defaults to OFF/Safe state
+  }
+
+  Wire.begin(LCD_SDA, LCD_SCL);
+  lcd.init();
+  lcd.backlight();
+  bootScreenInit();
+  bootProgress(5, "Initializing");
+  delay(400);
+
+  prefs.begin("aquavise", false);
+  connectWiFiOrStartPortal();
+
+  bootProgress(65, "Configuring cloud");
+  config.api_key           = FIREBASE_API_KEY;
+  config.database_url      = FIREBASE_DATABASE_URL;
+  auth.user.email          = FIREBASE_USER_EMAIL;
+  auth.user.password       = FIREBASE_USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  bootProgress(78, "Authenticating");
+  unsigned long authStart = millis();
+  while (!Firebase.ready() && millis() - authStart < 10000) {
+    delay(250);
+  }
+
+  if (Firebase.ready()) {
+    firebaseReady = true;
+    bootProgress(90, "Syncing data");
+    
+    readInitialPumpStates();
+
+    if (!Firebase.RTDB.beginStream(&fbStream, "/")) {
+      Serial.println("Stream begin failed: " + fbStream.errorReason());
+    } else {
+      Firebase.RTDB.setStreamCallback(&fbStream, streamCallback, streamTimeoutCallback);
+      streamStarted = true;
+    }
+
+    realTurbidity   = readTurbidityNTU();
+    realPH          = readPH();
+    realTemperature = readTemperatureC();
+    uploadSensorData();
+
+    bootProgress(100, "Ready");
+  } else {
+    bootProgress(90, "Cloud offline");
+    delay(800);
+    bootProgress(100, "Starting locally");
+  }
+
+  delay(900);
+  lcd.clear();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (Firebase.ready()) {
+    if (!firebaseReady) {
+      firebaseReady = true;
+      readInitialPumpStates();
+    }
+    if (!streamStarted) {
+      if (Firebase.RTDB.beginStream(&fbStream, "/")) {
+        Firebase.RTDB.setStreamCallback(&fbStream, streamCallback, streamTimeoutCallback);
+        streamStarted = true;
+      }
+    }
+  } else {
+    firebaseReady = false;
+    streamStarted = false;
+  }
+
+  if (now - lastTurbRead > TURB_READ_MS) {
+    realTurbidity = readTurbidityNTU();
+    lastTurbRead  = now;
+  }
+  if (now - lastPHRead > PH_READ_MS) {
+    realPH = readPH();
+    lastPHRead = now;
+  }
+  if (now - lastTempRead > TEMP_READ_MS) {
+    realTemperature = readTemperatureC();
+    lastTempRead = now;
+  }
+
+  if (now - lastSensorUpload > SENSOR_UPLOAD_MS) {
+    uploadSensorData();
+    lastSensorUpload = now;
+  }
+
+  if (now - lastLCDUpdate > LCD_INTERVAL_MS) {
+    updateLCD();
+    lastLCDUpdate = now;
+  }
+}
